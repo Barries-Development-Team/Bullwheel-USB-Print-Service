@@ -12,9 +12,10 @@ the ZPL to the local printer through the **Windows print spooler (RAW pass-throu
 Bullwheel server ──TCP :9100──▶ USB Print Service ──win32print RAW──▶ USB Zebra printer
 ```
 
-The service runs as a **task-tray application**: a small label icon appears in the
-notification area, and everything — picking the target printer, starting at logon,
-opening the log — is done from its right-click menu.
+The service runs as a **task-tray application**: its ski-lift-chair icon
+(`assets/ski_lift_chair.ico`, also the exe's file icon) appears in the notification
+area, and everything — picking the target printer, starting at logon, opening the
+log — is done from its right-click menu.
 
 The service is distributed as a **standalone exe built with PyInstaller**
 (`BullwheelUSBPrintService.exe`), so the computers it runs on need no Python
@@ -44,7 +45,8 @@ uv run pyinstaller usb_print_service.spec --noconfirm
 ```
 
 The build recipe is checked in as `usb_print_service.spec`; it produces a single
-windowless exe at `dist\BullwheelUSBPrintService.exe`. That one file is the whole
+windowless exe at `dist\BullwheelUSBPrintService.exe`, stamped with the app icon and
+with a copy of it bundled inside for the tray. That one file is the whole
 deployment — copy it to the computer the printer is attached to and run it.
 
 > Build on the same architecture you deploy to (a normal 64-bit Windows machine).
