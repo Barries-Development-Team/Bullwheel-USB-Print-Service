@@ -45,7 +45,10 @@ import threading
 import winreg
 
 try:
+	import win32api
+	import win32event
 	import win32print
+	import winerror
 except ImportError:
 	sys.exit("pywin32 is required to run this service. Install the project dependencies with: uv sync")
 
@@ -76,6 +79,12 @@ LOG_FILE_PATH = os.path.join(APPLICATION_DATA_DIRECTORY, "usb_print_service.log"
 # requiring administrator rights or a Task Scheduler entry.
 STARTUP_RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_RUN_VALUE_NAME = APPLICATION_NAME
+
+# Named mutex used to detect a second instance starting while one is already running.
+# Session-local (no "Global\" prefix) since the service is a per-user, no-admin-rights
+# app used by one interactive session at a time.
+SINGLE_INSTANCE_MUTEX_NAME = f"{APPLICATION_NAME}_SingleInstance"
+_single_instance_mutex_handle = None  # kept alive for the process lifetime; see is_another_instance_running
 
 # The app icon, shared with the exe itself: the PyInstaller spec stamps this same
 # .ico onto the exe and bundles a copy for the tray. A frozen build unpacks bundled
@@ -256,6 +265,19 @@ class USBPrintService:
 			self.tray_icon.notify(message, APPLICATION_NAME)
 		except Exception:
 			pass
+
+
+# ─── Single Instance ──────────────────────────────────────────────
+
+
+def is_another_instance_running() -> bool:
+	"""Create (or open) the service's named mutex and report whether another process
+	already holds it. The handle is kept in _single_instance_mutex_handle for the
+	life of this process — releasing it early would let a second instance pass the
+	check — so the OS releases it automatically when the process exits."""
+	global _single_instance_mutex_handle
+	_single_instance_mutex_handle = win32event.CreateMutex(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+	return win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS
 
 
 # ─── Start-at-Logon Registration ──────────────────────────────────
@@ -470,6 +492,13 @@ def main() -> None:
 		disable_startup()
 		return
 
+	if is_another_instance_running():
+		message = f"{APPLICATION_NAME} is already running."
+		logger.error(message)
+		if not arguments.headless:
+			show_error_message_box(message)
+		sys.exit(1)
+
 	printer_name = arguments.printer or load_saved_printer_name()
 	if printer_name and printer_name not in list_installed_printers():
 		logger.warning(
@@ -483,7 +512,7 @@ def main() -> None:
 	except OSError as error:
 		message = (
 			f"Could not listen on {arguments.host}:{arguments.port}: {error}\n"
-			"Another instance of the service may already be running."
+			"Another program may already be using this port."
 		)
 		logger.error(message)
 		if not arguments.headless:
