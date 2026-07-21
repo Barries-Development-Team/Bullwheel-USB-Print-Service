@@ -19,9 +19,14 @@ behavior instead, with no tray icon.
 The service is send-only — it does not read status back from the printer — so a printer
 reached this way reports "reachable, status unknown" from a ~HS host-status check.
 
+The service is normally deployed as a standalone exe built with PyInstaller (see the
+README's Building section), so target computers need no Python installation. Running
+the script directly behaves identically and is the usual way to work on it.
+
 Usage:
-    python usb_print_service.py [--host 0.0.0.0] [--port 9100] [--printer "<name>"]
-                                [--headless] [--install-startup] [--uninstall-startup]
+    BullwheelUSBPrintService.exe [--host 0.0.0.0] [--port 9100] [--printer "<name>"]
+                                 [--headless] [--install-startup] [--uninstall-startup]
+    uv run python src/usb_print_service.py [same options]
 
 If --printer is omitted, the printer last selected from the tray menu is used, falling
 back to the Windows default printer. The --port must match the port the ZebraPrinter
@@ -42,7 +47,7 @@ import winreg
 try:
 	import win32print
 except ImportError:
-	sys.exit("pywin32 is required to run this service. Install it with: pip install -r requirements.txt")
+	sys.exit("pywin32 is required to run this service. Install the project dependencies with: uv sync")
 
 try:
 	import pystray
@@ -247,9 +252,13 @@ class USBPrintService:
 
 
 def build_startup_command() -> str:
-	"""Build the command Windows runs at logon: this script launched by the windowless
-	pythonw interpreter (when available) so no console window appears. The command has
-	no --printer argument — the saved tray selection is restored instead."""
+	"""Build the command Windows runs at logon. A PyInstaller exe registers its own
+	path — sys.executable is the exe itself, and it is already windowless. A source
+	checkout instead registers the script launched by the windowless pythonw
+	interpreter (when available) so no console window appears. The command has no
+	--printer argument — the saved tray selection is restored instead."""
+	if getattr(sys, "frozen", False):
+		return f'"{sys.executable}"'
 	interpreter_path = sys.executable
 	windowless_interpreter_path = os.path.join(os.path.dirname(interpreter_path), "pythonw.exe")
 	if os.path.exists(windowless_interpreter_path):
@@ -464,7 +473,7 @@ def main() -> None:
 	if run_headless and not arguments.headless:
 		logger.warning(
 			"pystray and Pillow are not installed — running without a tray icon. "
-			"Install them with: pip install -r requirements.txt"
+			"Install the project dependencies with: uv sync"
 		)
 
 	if run_headless:

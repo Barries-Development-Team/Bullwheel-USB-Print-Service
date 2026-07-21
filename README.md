@@ -16,24 +16,50 @@ The service runs as a **task-tray application**: a small label icon appears in t
 notification area, and everything — picking the target printer, starting at logon,
 opening the log — is done from its right-click menu.
 
+The service is distributed as a **standalone exe built with PyInstaller**
+(`BullwheelUSBPrintService.exe`), so the computers it runs on need no Python
+installation — copy the exe over and run it.
+
 ## Requirements
 
 - Windows, with the Zebra printer installed and printing from a normal Windows app.
-- Python 3 (64-bit recommended).
-- `pywin32` (spooler access), `pystray` + `Pillow` (tray icon):
+- Nothing else on the target computer — the exe bundles Python and every dependency.
 
-  ```
-  uv sync
-  ```
+To **build** the exe or run from source you additionally need
+[uv](https://docs.astral.sh/uv/), which installs Python and the dependencies
+(`pywin32` for spooler access, `pystray` + `Pillow` for the tray icon, and
+`pyinstaller` for building):
+
+```
+uv sync
+```
+
+## Building the exe
+
+Double-click `build_usb_print_service.bat`, or run the same steps by hand:
+
+```
+uv sync
+uv run pyinstaller usb_print_service.spec --noconfirm
+```
+
+The build recipe is checked in as `usb_print_service.spec`; it produces a single
+windowless exe at `dist\BullwheelUSBPrintService.exe`. That one file is the whole
+deployment — copy it to the computer the printer is attached to and run it.
+
+> Build on the same architecture you deploy to (a normal 64-bit Windows machine).
+> PyInstaller does not cross-compile, so the exe must be built on Windows.
 
 ## Running
 
+Run `BullwheelUSBPrintService.exe`. During development, run from source instead:
+
 ```
-uv run python usb_print_service.py
+uv run python src/usb_print_service.py
 ```
 
-The icon appears in the task tray (check the overflow chevron ^ if it is hidden), and the
-service starts listening immediately.
+Either way the icon appears in the task tray (check the overflow chevron ^ if it is
+hidden), and the service starts listening immediately.
 
 ### Tray menu
 
@@ -53,13 +79,14 @@ The saved printer selection and the log live in
 ## Start at logon
 
 Tick **Start with Windows** in the tray menu (or run
-`python usb_print_service.py --install-startup`). This writes a per-user Run registry
-entry — no administrator rights needed — that launches the script with `pythonw.exe`, so
-no console window appears at logon. Untick the menu item (or `--uninstall-startup`) to
-remove it.
+`BullwheelUSBPrintService.exe --install-startup`). This writes a per-user Run registry
+entry — no administrator rights needed — that launches the exe at logon; the exe is
+windowless, so nothing flashes on screen. Untick the menu item (or
+`--uninstall-startup`) to remove it. When running from source, the same toggle
+registers the script under `pythonw.exe` instead.
 
-> If you later move the script or reinstall Python, toggle **Start with Windows** off and
-> on again to refresh the registered path.
+> If you later move or replace the exe (or, from source, move the script or reinstall
+> Python), toggle **Start with Windows** off and on again to refresh the registered path.
 
 ## Options
 
@@ -68,7 +95,7 @@ remove it.
 | `--host` | `0.0.0.0` | Listen address (all interfaces). |
 | `--port` | `9100` | **Must stay 9100** — it must match `ZebraPrinter.USB_PRINT_SERVICE_PORT`. |
 | `--printer` | saved tray selection, then system default | Windows printer queue name. Overrides the saved selection for this run only. |
-| `--headless` | off | Run without the tray icon, logging to the console — for Task Scheduler or debugging. |
+| `--headless` | off | Run without the tray icon — for Task Scheduler or debugging. From source this logs to the console; the exe is windowless and has no console, so it logs to the log file only. |
 | `--install-startup` / `--uninstall-startup` | — | Add / remove the start-at-logon registration from the command line, then exit. |
 
 ## Finding the printer name

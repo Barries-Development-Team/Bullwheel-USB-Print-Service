@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# PyInstaller build output
+build/
+dist/
