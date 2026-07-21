@@ -1,9 +1,22 @@
 [project]
 name = "bullwheel-usb-print-service"
-version = "0.1.0"
+description = "Print service for Bullwheel, responsible for forwarding print jobs to attached USB Zebra Printers. Designed for Windows 11."
+readme = "README.md"
+authors = [
+    {name = "Carter Luker", email = "carterluker13@gmail.com"}
+]
+version = "1.0.0"
 requires-python = ">=3.12"
 dependencies = [
     "pillow>=12.3.0",
     "pystray>=0.19.5",
     "pywin32>=312",
 ]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.21.0",
+]
+
+[project.urls]
+Repository = "https://github.com/Barries-Development-Team/Bullwheel-USB-Print-Service"
