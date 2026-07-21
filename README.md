@@ -133,5 +133,5 @@ Allow inbound **TCP 9100** through Windows Firewall on this machine. Give the co
   and the printer queue accepts the job, but not paper/head state. (Network printers still
   get full `~HS` status.)
 - Handles one job at a time (correct for a single printer; jobs never interleave).
-- One instance per computer: a second copy fails to start because port 9100 is already
-  taken, and says so in an error dialog.
+- One instance per computer: starting a second copy while one is already running shows
+  an "already running" error dialog and exits without starting.
