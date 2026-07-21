@@ -23,13 +23,13 @@ opening the log — is done from its right-click menu.
 - `pywin32` (spooler access), `pystray` + `Pillow` (tray icon):
 
   ```
-  pip install -r requirements.txt
+  uv sync
   ```
 
 ## Running
 
 ```
-python usb_print_service.py
+uv run python usb_print_service.py
 ```
 
 The icon appears in the task tray (check the overflow chevron ^ if it is hidden), and the
