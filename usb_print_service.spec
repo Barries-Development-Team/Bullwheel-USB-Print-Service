@@ -7,7 +7,9 @@ a = Analysis(
     ['src/usb_print_service.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    # Bundle the app icon so the tray can load it at runtime (unpacked under
+    # sys._MEIPASS/assets in the onefile exe).
+    datas=[('assets/ski_lift_chair.ico', 'assets')],
     # pystray selects its platform backend with a dynamic import, so name the
     # Windows backend explicitly rather than relying on hook coverage.
     hiddenimports=['pystray._win32'],
@@ -41,4 +43,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    # The exe's file icon, as shown in Explorer and the taskbar. The tray icon is
+    # the same file, loaded at runtime from the bundled copy above.
+    icon=['assets/ski_lift_chair.ico'],
 )

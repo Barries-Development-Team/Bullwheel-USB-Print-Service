@@ -77,6 +77,16 @@ LOG_FILE_PATH = os.path.join(APPLICATION_DATA_DIRECTORY, "usb_print_service.log"
 STARTUP_RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_RUN_VALUE_NAME = APPLICATION_NAME
 
+# The app icon, shared with the exe itself: the PyInstaller spec stamps this same
+# .ico onto the exe and bundles a copy for the tray. A frozen build unpacks bundled
+# files under sys._MEIPASS; a source checkout resolves it from the repository root
+# (this file's parent's parent).
+TRAY_ICON_FILE_PATH = os.path.join(
+	getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+	"assets",
+	"ski_lift_chair.ico",
+)
+
 logger = logging.getLogger("bullwheel_usb_print_service")
 
 
@@ -301,9 +311,9 @@ def disable_startup() -> None:
 # ─── Tray Application ─────────────────────────────────────────────
 
 
-def create_tray_image():
-	"""Draw the tray icon in code — a white label tag with barcode stripes — so the
-	service needs no bundled icon file."""
+def draw_fallback_tray_image():
+	"""Draw a stand-in tray icon in code — a white label tag with barcode stripes —
+	used only when the app icon file cannot be loaded."""
 	image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
 	drawing = ImageDraw.Draw(image)
 	drawing.rounded_rectangle(
@@ -313,6 +323,17 @@ def create_tray_image():
 	for stripe_x, stripe_width in barcode_stripes:
 		drawing.rectangle((stripe_x, 18, stripe_x + stripe_width, 46), fill=(60, 64, 72, 255))
 	return image
+
+
+def load_tray_image():
+	"""Load the ski-lift-chair app icon for the tray, falling back to the drawn
+	stand-in so a missing or unreadable icon file cannot keep the service from
+	starting."""
+	try:
+		return Image.open(TRAY_ICON_FILE_PATH)
+	except OSError:
+		logger.warning(f"Could not load the tray icon from '{TRAY_ICON_FILE_PATH}' — using the built-in stand-in icon.")
+		return draw_fallback_tray_image()
 
 
 def make_printer_menu_item(service: USBPrintService, printer_name: str):
@@ -383,7 +404,7 @@ def run_tray_icon(service: USBPrintService) -> None:
 	)
 	tray_icon = pystray.Icon(
 		"bullwheel_usb_print_service",
-		create_tray_image(),
+		load_tray_image(),
 		f"{APPLICATION_NAME} (port {service.port})",
 		menu,
 	)
