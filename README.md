@@ -1,3 +1,5 @@
+<img width="128" height="128" alt="ski_lift_chair_icon" src="https://github.com/user-attachments/assets/b0898516-f6e3-4056-b301-c161b5393a5b" />
+
 # Bullwheel USB Print Service
 
 A small Windows-side relay that lets Bullwheel print to a **USB-connected Zebra printer**
