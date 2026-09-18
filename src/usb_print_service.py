@@ -4,17 +4,26 @@
 """
 Bullwheel USB Print Service.
 
-Listens for raw ZPL print jobs over TCP and forwards them to a USB-connected Zebra
-printer through the Windows print spooler (RAW pass-through). This lets the Bullwheel
-server print to USB printers exactly as it prints to networked ones: the ZebraPrinter
-handler opens a socket to this service's host and port instead of to a printer's own
-:9100 listener, and this service relays the bytes to the local USB device.
+Runs two listeners side by side and forwards both to USB-connected Zebra printers
+through the Windows print spooler (RAW pass-through):
+
+- USB method: a raw TCP listener on port 9100. The Frappe server connects to this
+  service exactly as it would to a networked printer — the ZebraPrinter handler opens
+  a socket to this service's host and port instead of to a printer's own :9100
+  listener — and this service relays the bytes to the local USB device.
+- Browser method: an HTTP listener on 127.0.0.1:9110. The user's browser, running
+  Bullwheel on the same computer, POSTs already-rendered ZPL to /print (with CORS and
+  Private Network Access handling so the production HTTPS site can reach a loopback
+  service), and this service forwards it to the local USB device the same way.
+
+Neither listener renders templates or looks up data — both receive finished ZPL and
+send it to the printer unchanged.
 
 The service runs as a Windows task-tray application. Right-clicking the tray icon
-shows the current target, lets the user switch the target printer (the choice is
-saved and restored on the next run), toggles starting the service automatically at
+shows the current target, lets the user switch the default target printer (the choice
+is saved and restored on the next run), toggles starting the service automatically at
 logon, and opens the log file. Passing --headless runs the original console-only
-behavior instead, with no tray icon.
+behavior instead, with no tray icon. Both listeners run in either mode.
 
 The service is send-only — it does not read status back from the printer — so a printer
 reached this way reports "reachable, status unknown" from a ~HS host-status check.
@@ -24,14 +33,20 @@ README's Building section), so target computers need no Python installation. Run
 the script directly behaves identically and is the usual way to work on it.
 
 Usage:
-    BullwheelUSBPrintService.exe [--host 0.0.0.0] [--port 9100] [--printer "<name>"]
+    BullwheelUSBPrintService.exe [--host 0.0.0.0] [--port 9100] [--http-port 9110]
+                                 [--printer "<name>"]
                                  [--headless] [--install-startup] [--uninstall-startup]
     uv run python src/usb_print_service.py [same options]
 
 If --printer is omitted, the printer last selected from the tray menu is used, falling
 back to the Windows default printer. The --port must match the port the ZebraPrinter
 handler dials (9100) and the address must match the `connected_computer_address` set
-on the Label Printer record in Bullwheel.
+on the Label Printer record in Bullwheel. The --http-port must match the port in
+`BROWSER_PRINT_SERVICE_URL` in Bullwheel's printing.js.
+
+The printer-name mapping (Bullwheel `printer_name` → Windows printer, for the Browser
+method) and the allowed browser origins (for CORS) are configured in settings.json —
+see the README's Configuration section.
 """
 
 import argparse
@@ -43,6 +58,7 @@ import socket
 import sys
 import threading
 import winreg
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
 	import win32api
@@ -66,6 +82,11 @@ APPLICATION_NAME = "Bullwheel USB Print Service"
 LISTEN_BACKLOG = 5
 CONNECTION_IDLE_TIMEOUT = 30  # seconds a single connection may stall before it is dropped
 RECEIVE_BUFFER_SIZE = 4096
+
+DEFAULT_HTTP_PORT = 9110
+# Loopback only — the Browser endpoint is for browsers on this computer, never the network.
+HTTP_HOST = "127.0.0.1"
+MAX_HTTP_BODY_SIZE = 25_000_000  # bytes; generous headroom over any realistic ZPL batch
 
 # Settings and logs live under %APPDATA% because the service normally runs windowless
 # (pythonw at logon) with no console and no fixed working directory.
@@ -124,25 +145,62 @@ def configure_logging() -> None:
 
 
 # ─── Saved Settings ───────────────────────────────────────────────
+#
+# settings.json holds everything the README documents as configurable without a code
+# change: the default printer (also editable from the tray), the Browser method's
+# printer_name → Windows printer mapping, and its allowed CORS origins. The file is
+# read at startup (and again whenever the tray changes the default printer); editing
+# printer_mapping or allowed_origins by hand takes effect on the next restart.
+
+
+def load_settings() -> dict:
+	"""Return the full saved settings dict, or {} when nothing has been saved yet or
+	the file is unreadable/corrupt."""
+	try:
+		with open(SETTINGS_FILE_PATH, encoding="utf-8") as settings_file:
+			settings = json.load(settings_file)
+		return settings if isinstance(settings, dict) else {}
+	except (OSError, ValueError):
+		return {}
+
+
+def save_settings(settings: dict) -> None:
+	"""Write the full settings dict, creating the application data directory if needed."""
+	os.makedirs(APPLICATION_DATA_DIRECTORY, exist_ok=True)
+	with open(SETTINGS_FILE_PATH, "w", encoding="utf-8") as settings_file:
+		json.dump(settings, settings_file, indent="\t")
 
 
 def load_saved_printer_name() -> str | None:
 	"""Return the printer name persisted by a previous tray selection, or None when
 	nothing has been saved yet (the service then follows the Windows default printer)."""
-	try:
-		with open(SETTINGS_FILE_PATH, encoding="utf-8") as settings_file:
-			settings = json.load(settings_file)
-		return settings.get("printer_name") or None
-	except (OSError, ValueError):
-		return None
+	return load_settings().get("printer_name") or None
 
 
 def save_printer_name(printer_name: str | None) -> None:
-	"""Persist the selected printer so the tray choice survives restarts and logons.
-	Saving None records that the service should follow the Windows default printer."""
-	os.makedirs(APPLICATION_DATA_DIRECTORY, exist_ok=True)
-	with open(SETTINGS_FILE_PATH, "w", encoding="utf-8") as settings_file:
-		json.dump({"printer_name": printer_name}, settings_file, indent="\t")
+	"""Persist the selected printer so the tray choice survives restarts and logons,
+	preserving the rest of settings.json. Saving None records that the service should
+	follow the Windows default printer."""
+	settings = load_settings()
+	settings["printer_name"] = printer_name
+	save_settings(settings)
+
+
+def load_printer_mapping() -> dict[str, str]:
+	"""Return the configured Bullwheel printer_name → Windows printer mapping, used to
+	resolve Browser-method jobs. Empty when nothing is configured, so every Browser job
+	falls back to the default printer — fine for a computer with a single Zebra printer."""
+	mapping = load_settings().get("printer_mapping")
+	return mapping if isinstance(mapping, dict) else {}
+
+
+def load_allowed_origins() -> list[str]:
+	"""Return the configured list of browser origins allowed to call the Browser
+	method's HTTP endpoint. Empty means no browser origin is allowed — the Browser
+	method won't work until this is configured, which is deliberate: without an
+	allow-list any website the user visits could send print jobs to their printer."""
+	origins = load_settings().get("allowed_origins")
+	return [origin for origin in origins if isinstance(origin, str)] if isinstance(origins, list) else []
 
 
 # ─── Printers ─────────────────────────────────────────────────────
@@ -155,20 +213,35 @@ def list_installed_printers() -> list[str]:
 	return sorted(printer[2] for printer in win32print.EnumPrinters(enumeration_flags))
 
 
+_printer_locks: dict[str, threading.Lock] = {}
+_printer_locks_guard = threading.Lock()
+
+
+def get_printer_lock(printer_name: str) -> threading.Lock:
+	"""Return the lock guarding writes to the named Windows printer, creating it on
+	first use. USB jobs and Browser jobs can target the same printer from different
+	threads at the same moment; this serializes them per-printer so one job's spooler
+	call always completes before the next starts, without blocking unrelated printers."""
+	with _printer_locks_guard:
+		return _printer_locks.setdefault(printer_name, threading.Lock())
+
+
 def send_to_printer(printer_name: str, data: bytes) -> None:
-	"""Forward raw bytes to the named Windows printer as a RAW spooler job, so the ZPL
-	reaches the printer verbatim without the driver reformatting or interpreting it."""
-	printer_handle = win32print.OpenPrinter(printer_name)
-	try:
-		win32print.StartDocPrinter(printer_handle, 1, ("Bullwheel Label", None, "RAW"))
+	"""Forward raw bytes to the named Windows printer as a single RAW spooler job, so
+	the ZPL reaches the printer verbatim without the driver reformatting or
+	interpreting it, and without interleaving with any other job on the same printer."""
+	with get_printer_lock(printer_name):
+		printer_handle = win32print.OpenPrinter(printer_name)
 		try:
-			win32print.StartPagePrinter(printer_handle)
-			win32print.WritePrinter(printer_handle, data)
-			win32print.EndPagePrinter(printer_handle)
+			win32print.StartDocPrinter(printer_handle, 1, ("Bullwheel Label", None, "RAW"))
+			try:
+				win32print.StartPagePrinter(printer_handle)
+				win32print.WritePrinter(printer_handle, data)
+				win32print.EndPagePrinter(printer_handle)
+			finally:
+				win32print.EndDocPrinter(printer_handle)
 		finally:
-			win32print.EndDocPrinter(printer_handle)
-	finally:
-		win32print.ClosePrinter(printer_handle)
+			win32print.ClosePrinter(printer_handle)
 
 
 def receive_job(connection: socket.socket) -> bytes:
@@ -195,10 +268,11 @@ class USBPrintService:
 	target through set_printer_name while the server thread resolves it per job, so a
 	new selection applies to the very next job without restarting the service."""
 
-	def __init__(self, host: str, port: int, printer_name: str | None):
+	def __init__(self, host: str, port: int, printer_name: str | None, printer_mapping: dict[str, str] | None = None):
 		self.host = host
 		self.port = port
 		self.printer_name = printer_name  # None → follow the Windows default printer
+		self.printer_mapping = printer_mapping or {}  # Browser printer_name → Windows printer
 		self.listener = None
 		self.tray_icon = None  # set by run_tray_icon; used for failure notifications
 
@@ -212,6 +286,14 @@ class USBPrintService:
 			return win32print.GetDefaultPrinter()
 		except Exception:
 			return None
+
+	def resolve_windows_printer(self, bullwheel_printer_name: str | None) -> str | None:
+		"""Resolve a Bullwheel-side printer_name (Browser method) to a Windows printer:
+		the configured mapping entry first, then the default target. Used for USB jobs
+		too, with bullwheel_printer_name always None, so they only ever use the default."""
+		if bullwheel_printer_name and bullwheel_printer_name in self.printer_mapping:
+			return self.printer_mapping[bullwheel_printer_name]
+		return self.resolve_printer_name()
 
 	def set_printer_name(self, printer_name: str | None) -> None:
 		"""Switch the target printer and persist the choice; it takes effect on the
@@ -242,17 +324,17 @@ class USBPrintService:
 			try:
 				data = receive_job(connection)
 				if not data:
-					logger.info(f"Empty job from {client} — nothing to print.")
+					logger.info(f"[USB] Empty job from {client} — nothing to print.")
 					continue
 				printer_name = self.resolve_printer_name()
 				if not printer_name:
 					raise RuntimeError("no target printer is selected and Windows has no default printer")
 				send_to_printer(printer_name, data)
-				logger.info(f"Printed {len(data)} bytes from {client} to '{printer_name}'.")
+				logger.info(f"[USB] Printed {len(data)} bytes from {client} to '{printer_name}'.")
 			except Exception as error:
 				# Never let one bad job take the service down.
-				logger.error(f"Failed to handle job from {client}: {error}")
-				self.notify(f"Print job failed: {error}")
+				logger.error(f"[USB] Failed to handle job from {client}: {error}")
+				self.notify(f"USB print job failed: {error}")
 			finally:
 				connection.close()
 
@@ -265,6 +347,167 @@ class USBPrintService:
 			self.tray_icon.notify(message, APPLICATION_NAME)
 		except Exception:
 			pass
+
+
+# ─── Browser Method — HTTP Listener ───────────────────────────────
+#
+# The user's browser, running Bullwheel on this same computer, POSTs already-rendered
+# ZPL to /print. Unlike the USB listener this must handle CORS (the page and the
+# service are different origins) and Chrome/Edge Private Network Access (a public
+# HTTPS page calling a loopback address) or the browser blocks the request before it
+# ever reaches here.
+
+
+def is_origin_allowed(origin: str | None, allowed_origins: list[str]) -> bool:
+	"""Return whether the given Origin header value is on the configured allow-list.
+	An endpoint that accepted any origin would let any website the user visits print to
+	their printer, so this is a hard allow-list match, never a wildcard."""
+	return origin is not None and origin in allowed_origins
+
+
+class PrintRequestError(Exception):
+	"""A Browser-method request that should be rejected with a specific HTTP status
+	and a short, human-readable message — the message becomes Bullwheel's error text."""
+
+	def __init__(self, status_code: int, message: str):
+		super().__init__(message)
+		self.status_code = status_code
+		self.message = message
+
+
+def make_browser_print_handler(service: "USBPrintService", allowed_origins: list[str]):
+	"""Build the BaseHTTPRequestHandler subclass used by the Browser method's HTTP
+	server, bound to this service instance and the configured origin allow-list. A
+	factory is used because http.server instantiates a fresh handler per request and
+	only takes a class, not an already-constructed object."""
+
+	class BrowserPrintRequestHandler(BaseHTTPRequestHandler):
+		server_version = "BullwheelUSBPrintService/1.0"
+
+		def log_message(self, format, *args):  # noqa: A002 — BaseHTTPRequestHandler's signature
+			# Route the built-in per-request access log through our own logger instead
+			# of stderr, and skip it entirely — do_POST/do_OPTIONS already log outcomes.
+			pass
+
+		def _send_cors_headers(self, origin: str | None) -> None:
+			if is_origin_allowed(origin, allowed_origins):
+				self.send_header("Access-Control-Allow-Origin", origin)
+			self.send_header("Vary", "Origin")
+
+		def _send_text_response(self, status_code: int, body: str, origin: str | None) -> None:
+			body_bytes = body.encode("utf-8")
+			self.send_response(status_code)
+			self._send_cors_headers(origin)
+			self.send_header("Content-Type", "text/plain; charset=utf-8")
+			self.send_header("Content-Length", str(len(body_bytes)))
+			self.end_headers()
+			if body_bytes:
+				self.wfile.write(body_bytes)
+
+		def do_OPTIONS(self) -> None:
+			"""Answer the CORS/Private Network Access preflight the browser sends before
+			the real POST, since the request carries a JSON Content-Type."""
+			origin = self.headers.get("Origin")
+			if self.path != "/print":
+				self.send_response(204)
+				self.end_headers()
+				return
+			self.send_response(204)
+			self._send_cors_headers(origin)
+			self.send_header("Access-Control-Allow-Methods", "POST")
+			self.send_header("Access-Control-Allow-Headers", "Content-Type")
+			self.send_header("Access-Control-Allow-Private-Network", "true")
+			self.send_header("Access-Control-Max-Age", "600")
+			self.end_headers()
+
+		def do_POST(self) -> None:
+			origin = self.headers.get("Origin")
+			if self.path != "/print":
+				self._send_text_response(404, "Not found.", origin)
+				return
+			try:
+				self._handle_print(origin)
+			except PrintRequestError as error:
+				logger.error(f"[Browser] Rejected request from origin '{origin}': {error.message}")
+				self._send_text_response(error.status_code, error.message, origin)
+			except Exception as error:
+				logger.error(f"[Browser] Unexpected error handling request from origin '{origin}': {error}")
+				self._send_text_response(500, "Unexpected error handling the print job.", origin)
+
+		def _handle_print(self, origin: str | None) -> None:
+			if origin is not None and not is_origin_allowed(origin, allowed_origins):
+				raise PrintRequestError(403, "This origin is not allowed to print.")
+
+			content_type = self.headers.get("Content-Type", "")
+			if content_type.split(";")[0].strip().lower() != "application/json":
+				raise PrintRequestError(415, "Content-Type must be application/json.")
+
+			try:
+				content_length = int(self.headers.get("Content-Length", "0"))
+			except ValueError:
+				raise PrintRequestError(400, "Missing or invalid Content-Length.")
+			if content_length <= 0:
+				raise PrintRequestError(400, "Request body is empty.")
+			if content_length > MAX_HTTP_BODY_SIZE:
+				raise PrintRequestError(400, "Request body is too large.")
+			raw_body = self.rfile.read(content_length)
+
+			try:
+				payload = json.loads(raw_body.decode("utf-8"))
+			except (UnicodeDecodeError, ValueError):
+				raise PrintRequestError(400, "Request body is not valid JSON.")
+			if not isinstance(payload, dict):
+				raise PrintRequestError(400, "Request body must be a JSON object.")
+
+			bullwheel_printer_name = payload.get("printer_name")
+			if not isinstance(bullwheel_printer_name, str) or not bullwheel_printer_name:
+				raise PrintRequestError(400, "Missing or invalid 'printer_name'.")
+			zpl = payload.get("zpl")
+			if not isinstance(zpl, str) or not zpl:
+				raise PrintRequestError(400, "Missing or empty 'zpl'.")
+			media_type = payload.get("media_type")
+			dpi = payload.get("dpi")
+
+			windows_printer_name = service.resolve_windows_printer(bullwheel_printer_name)
+			if not windows_printer_name:
+				raise PrintRequestError(404, f"No printer is configured for \"{bullwheel_printer_name}\".")
+
+			data = zpl.encode("utf-8")
+			try:
+				send_to_printer(windows_printer_name, data)
+			except Exception as error:
+				raise PrintRequestError(503, f'Printer "{windows_printer_name}" is offline or could not be reached.') from error
+
+			logger.info(
+				f"[Browser] Printed {len(data)} bytes (printer_name='{bullwheel_printer_name}', "
+				f"media_type={media_type!r}, dpi={dpi!r}) to '{windows_printer_name}'."
+			)
+			self.send_response(204)
+			self._send_cors_headers(origin)
+			self.send_header("Content-Length", "0")
+			self.end_headers()
+
+		def do_GET(self) -> None:
+			self._send_text_response(404, "Not found.", self.headers.get("Origin"))
+
+	return BrowserPrintRequestHandler
+
+
+def start_browser_print_server(
+	service: "USBPrintService", http_port: int, allowed_origins: list[str]
+) -> ThreadingHTTPServer:
+	"""Start the Browser method's HTTP listener on 127.0.0.1, bound to loopback only —
+	this endpoint is for browsers on this computer, never reachable from the network.
+	Raises OSError if the port is already taken."""
+	if not allowed_origins:
+		logger.warning(
+			"No allowed_origins are configured in settings.json — every Browser-method "
+			"request will be rejected with 403 until at least one origin is added."
+		)
+	handler_class = make_browser_print_handler(service, allowed_origins)
+	http_server = ThreadingHTTPServer((HTTP_HOST, http_port), handler_class)
+	logger.info(f"{APPLICATION_NAME} listening for Browser print jobs on http://{HTTP_HOST}:{http_port}/print.")
+	return http_server
 
 
 # ─── Single Instance ──────────────────────────────────────────────
@@ -393,7 +636,7 @@ def build_printer_menu_items(service: USBPrintService):
 		yield make_printer_menu_item(service, printer_name)
 
 
-def run_tray_icon(service: USBPrintService) -> None:
+def run_tray_icon(service: USBPrintService, http_port: int) -> None:
 	"""Create the task-tray icon and block on its event loop until Exit is chosen.
 	The header row shows the live target, Target Printer switches it, Start with
 	Windows toggles the logon registration, and Open Log File jumps to the log."""
@@ -427,7 +670,7 @@ def run_tray_icon(service: USBPrintService) -> None:
 	tray_icon = pystray.Icon(
 		"bullwheel_usb_print_service",
 		load_tray_image(),
-		f"{APPLICATION_NAME} (port {service.port})",
+		f"{APPLICATION_NAME} (USB port {service.port}, Browser port {http_port})",
 		menu,
 	)
 	service.tray_icon = tray_icon
@@ -459,6 +702,13 @@ def main() -> None:
 		type=int,
 		default=9100,
 		help="Port to listen on (default: 9100, must match the Label Printer configuration).",
+	)
+	parser.add_argument(
+		"--http-port",
+		type=int,
+		default=DEFAULT_HTTP_PORT,
+		help=f"Port for the Browser method's HTTP listener on 127.0.0.1 (default: {DEFAULT_HTTP_PORT}, "
+		"must match BROWSER_PRINT_SERVICE_URL in Bullwheel's printing.js).",
 	)
 	parser.add_argument(
 		"--printer",
@@ -506,7 +756,10 @@ def main() -> None:
 			"jobs will fail until another printer is selected from the tray menu."
 		)
 
-	service = USBPrintService(arguments.host, arguments.port, printer_name)
+	printer_mapping = load_printer_mapping()
+	allowed_origins = load_allowed_origins()
+
+	service = USBPrintService(arguments.host, arguments.port, printer_name, printer_mapping)
 	try:
 		service.start_listening()
 	except OSError as error:
@@ -518,6 +771,20 @@ def main() -> None:
 		if not arguments.headless:
 			show_error_message_box(message)
 		sys.exit(1)
+
+	try:
+		http_server = start_browser_print_server(service, arguments.http_port, allowed_origins)
+	except OSError as error:
+		message = (
+			f"Could not listen on {HTTP_HOST}:{arguments.http_port}: {error}\n"
+			"Another program may already be using this port."
+		)
+		logger.error(message)
+		if not arguments.headless:
+			show_error_message_box(message)
+		sys.exit(1)
+	http_server_thread = threading.Thread(target=http_server.serve_forever, name="browser-print-server", daemon=True)
+	http_server_thread.start()
 
 	run_headless = arguments.headless or not TRAY_SUPPORT_AVAILABLE
 	if run_headless and not arguments.headless:
@@ -534,7 +801,7 @@ def main() -> None:
 	else:
 		server_thread = threading.Thread(target=service.serve_forever, name="usb-print-server", daemon=True)
 		server_thread.start()
-		run_tray_icon(service)
+		run_tray_icon(service, arguments.http_port)
 		logger.info("Shutting down.")
 
 
