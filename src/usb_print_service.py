@@ -78,7 +78,6 @@ except ImportError:
 
 try:
 	import tkinter as tk
-	from tkinter import simpledialog
 
 	TKINTER_SUPPORT_AVAILABLE = True
 except ImportError:
@@ -354,6 +353,7 @@ class USBPrintService:
 		self.allowed_origins.append(origin)
 		save_allowed_origins(self.allowed_origins)
 		logger.info(f"Allowed origin added: '{origin}'.")
+		self.refresh_tray_menu()
 		return True
 
 	def remove_allowed_origin(self, origin: str) -> None:
@@ -364,6 +364,15 @@ class USBPrintService:
 		self.allowed_origins.remove(origin)
 		save_allowed_origins(self.allowed_origins)
 		logger.info(f"Allowed origin removed: '{origin}'.")
+		self.refresh_tray_menu()
+
+	def refresh_tray_menu(self) -> None:
+		"""Rebuild the tray menu so it reflects the current settings. On Windows pystray
+		builds the native menu ahead of time rather than each time it opens, so a change
+		made outside its own click handling — such as the Add Origin dialog, which runs on
+		its own thread — doesn't appear until this is called."""
+		if self.tray_icon is not None:
+			self.tray_icon.update_menu()
 
 	def start_listening(self) -> None:
 		"""Bind and listen on the configured host and port, raising OSError on failure —
@@ -704,23 +713,85 @@ def prompt_for_origin() -> str | None:
 	"""Show a small text-entry dialog asking for a browser origin to allow, returning
 	the raw text entered or None if the dialog was cancelled. Requires tkinter, which
 	ships with a standard Python install; callers should check TKINTER_SUPPORT_AVAILABLE
-	first."""
+	first.
+
+	The dialog is the Tk root itself rather than a simpledialog over a withdrawn root: a
+	dialog whose parent is withdrawn never receives keyboard focus when opened from a
+	background process, which left the text box dead and the window unclosable. It must
+	be called from a thread that is not running the tray's message loop."""
+	result: list[str | None] = [None]
 	root = tk.Tk()
-	root.withdraw()
-	root.attributes("-topmost", True)
-	try:
-		return simpledialog.askstring(
-			APPLICATION_NAME,
-			"Browser origin to allow (scheme + host, e.g. https://your-bullwheel-host):",
-			parent=root,
-		)
-	finally:
+	root.title(APPLICATION_NAME)
+	root.resizable(False, False)
+
+	def accept(event=None):
+		result[0] = entry.get()
 		root.destroy()
+
+	def cancel(event=None):
+		root.destroy()
+
+	tk.Label(
+		root,
+		text="Browser origin to allow (scheme + host, e.g. https://your-bullwheel-host):",
+		anchor="w",
+	).pack(fill="x", padx=12, pady=(12, 4))
+	entry = tk.Entry(root, width=55)
+	entry.pack(fill="x", padx=12)
+	button_row = tk.Frame(root)
+	button_row.pack(fill="x", padx=12, pady=12)
+	tk.Button(button_row, text="Cancel", width=10, command=cancel).pack(side="right")
+	tk.Button(button_row, text="OK", width=10, command=accept).pack(side="right", padx=(0, 6))
+
+	root.protocol("WM_DELETE_WINDOW", cancel)
+	root.bind("<Return>", accept)
+	root.bind("<Escape>", cancel)
+
+	# Centre on screen, then force the window to the foreground so it takes input even
+	# though this process was started in the background.
+	root.update_idletasks()
+	x = (root.winfo_screenwidth() - root.winfo_reqwidth()) // 2
+	y = (root.winfo_screenheight() - root.winfo_reqheight()) // 3
+	root.geometry(f"+{x}+{y}")
+	root.attributes("-topmost", True)
+	root.lift()
+	root.focus_force()
+	entry.focus_set()
+
+	root.mainloop()
+	return result[0]
+
+
+_tray_dialog_lock = threading.Lock()
+
+
+def run_tray_dialog(name: str, dialog_action) -> None:
+	"""Run a dialog-showing action on its own thread so the tray's message loop stays
+	responsive while the dialog is open — blocking that loop is what left dialogs
+	unresponsive and unclosable. Only one tray dialog can be open at a time; a request
+	made while another is showing is ignored."""
+	if not _tray_dialog_lock.acquire(blocking=False):
+		return
+
+	def run() -> None:
+		try:
+			dialog_action()
+		except Exception:
+			logger.exception(f"The {name} dialog failed.")
+		finally:
+			_tray_dialog_lock.release()
+
+	threading.Thread(target=run, name=f"{name}-dialog", daemon=True).start()
 
 
 def add_allowed_origin_interactively(service: USBPrintService) -> None:
-	"""Handle the tray's Add Origin… command: prompt for text, validate it as an
-	origin, and add it to the service's allow-list, notifying on any problem."""
+	"""Handle the tray's Add Origin… command."""
+	run_tray_dialog("add-origin", lambda: add_allowed_origin_from_dialog(service))
+
+
+def add_allowed_origin_from_dialog(service: USBPrintService) -> None:
+	"""Prompt for text, validate it as an origin, and add it to the service's
+	allow-list, notifying on any problem."""
 	if not TKINTER_SUPPORT_AVAILABLE:
 		show_error_message_box(
 			"Adding an origin from the tray needs tkinter, which is missing from this "
@@ -744,17 +815,20 @@ def make_allowed_origin_menu_item(service: USBPrintService, origin: str):
 	confirming — removing one breaks Browser printing for anyone using it, so it isn't
 	a single accidental click away."""
 
-	def remove_origin(icon, item):
+	def confirm_and_remove() -> None:
 		if confirm_message_box(f"Stop allowing this origin to print?\n\n{origin}"):
 			service.remove_allowed_origin(origin)
+
+	def remove_origin(icon, item):
+		run_tray_dialog("remove-origin", confirm_and_remove)
 
 	return pystray.MenuItem(f"Remove: {origin}", remove_origin)
 
 
 def build_allowed_origins_menu_items(service: USBPrintService):
 	"""Yield Add Origin… plus one removable item per currently allowed origin, or a
-	disabled placeholder when none are configured. The tray menu calls this every time
-	it opens, so additions and removals are reflected immediately."""
+	disabled placeholder when none are configured. The tray menu is rebuilt by
+	USBPrintService.refresh_tray_menu whenever the allow-list changes."""
 	yield pystray.MenuItem("Add Origin…", lambda icon, item: add_allowed_origin_interactively(service))
 	yield pystray.Menu.SEPARATOR
 	if service.allowed_origins:
@@ -812,7 +886,11 @@ def show_error_message_box(message: str) -> None:
 	import ctypes
 
 	MB_ICONERROR = 0x00000010
-	ctypes.windll.user32.MessageBoxW(None, message, APPLICATION_NAME, MB_ICONERROR)
+	MB_SETFOREGROUND = 0x00010000
+	MB_TOPMOST = 0x00040000
+	ctypes.windll.user32.MessageBoxW(
+		None, message, APPLICATION_NAME, MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST
+	)
 
 
 def confirm_message_box(message: str) -> bool:
@@ -822,8 +900,12 @@ def confirm_message_box(message: str) -> bool:
 
 	MB_YESNO = 0x00000004
 	MB_ICONQUESTION = 0x00000020
+	MB_SETFOREGROUND = 0x00010000
+	MB_TOPMOST = 0x00040000
 	IDYES = 6
-	result = ctypes.windll.user32.MessageBoxW(None, message, APPLICATION_NAME, MB_YESNO | MB_ICONQUESTION)
+	result = ctypes.windll.user32.MessageBoxW(
+		None, message, APPLICATION_NAME, MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST
+	)
 	return result == IDYES
 
 
