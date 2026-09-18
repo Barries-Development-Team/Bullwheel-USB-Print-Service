@@ -78,12 +78,25 @@ Right-click the icon:
 |---|---|
 | **Forwarding to: …** | Shows the printer the next job will print to. |
 | **Target Printer ▸** | Lists every installed printer plus **System Default**. Click one to switch — it takes effect on the very next job, and the choice is **saved** and restored on the next run. The list is refreshed each time the menu opens. |
+| **Allowed Origins ▸** | Manages the Browser method's CORS allow-list (see below). |
 | **Start with Windows** | Toggles starting the service automatically at logon (see below). |
 | **Open Log File** | Opens the job log in your default text viewer. |
 | **Exit** | Stops the service. |
 
 The saved printer selection and the log live in
 `%APPDATA%\Bullwheel\USB Print Service\` (`settings.json`, `usb_print_service.log`).
+
+#### Allowed Origins ▸
+
+Manages `allowed_origins` (§ Configuration below) without hand-editing `settings.json`:
+
+| Item | Behavior |
+|---|---|
+| **Add Origin…** | Prompts for an origin (e.g. `https://your-bullwheel-host`) and adds it. Takes effect on the very next Browser-method request — no restart needed. |
+| *(each allowed origin)* | Listed as **Remove: `<origin>`** — click to remove it, after a confirmation dialog. |
+| *(none allowed)* | Shown as a disabled placeholder when the list is empty; every Browser-method request is rejected with `403` until at least one origin is added. |
+
+Changes made here are saved to `settings.json` immediately, the same as editing it by hand.
 
 ## Start at logon
 
@@ -110,10 +123,12 @@ registers the script under `pythonw.exe` instead.
 
 ## Configuration
 
-Most configuration is the tray's **Target Printer** menu (the default Windows printer).
-Two more settings — the Browser method's printer mapping and its allowed origins — are
-edited directly in `%APPDATA%\Bullwheel\USB Print Service\settings.json`, since they
-don't fit a simple menu. Restart the service after editing them by hand.
+The default printer and the Browser method's allowed origins can both be managed from
+the tray (**Target Printer** and **Allowed Origins**, above) and take effect
+immediately — no restart. The printer mapping doesn't fit a simple menu, so it's edited
+directly in `%APPDATA%\Bullwheel\USB Print Service\settings.json`; restart the service
+after changing it by hand. (Editing `allowed_origins` by hand instead of from the tray
+also works — just restart afterwards to pick it up.)
 
 ```json
 {

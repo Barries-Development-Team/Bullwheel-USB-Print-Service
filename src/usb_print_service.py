@@ -76,6 +76,14 @@ try:
 except ImportError:
 	TRAY_SUPPORT_AVAILABLE = False
 
+try:
+	import tkinter as tk
+	from tkinter import simpledialog
+
+	TKINTER_SUPPORT_AVAILABLE = True
+except ImportError:
+	TKINTER_SUPPORT_AVAILABLE = False
+
 
 APPLICATION_NAME = "Bullwheel USB Print Service"
 
@@ -203,6 +211,32 @@ def load_allowed_origins() -> list[str]:
 	return [origin for origin in origins if isinstance(origin, str)] if isinstance(origins, list) else []
 
 
+def save_allowed_origins(allowed_origins: list[str]) -> None:
+	"""Persist the allowed-origins list, preserving the rest of settings.json. Called
+	whenever the tray's Allowed Origins menu adds or removes one, so the change
+	survives a restart."""
+	settings = load_settings()
+	settings["allowed_origins"] = allowed_origins
+	save_settings(settings)
+
+
+def normalize_origin(raw_origin: str) -> str:
+	"""Parse user-entered text into a bare origin (scheme://host[:port]), the form
+	browsers send in the Origin header and the only form the allow-list should hold.
+	Raises ValueError with a user-facing message when the text isn't a usable origin."""
+	from urllib.parse import urlsplit
+
+	raw_origin = raw_origin.strip()
+	if not raw_origin:
+		raise ValueError("Enter an origin, e.g. https://your-bullwheel-host.")
+	parsed = urlsplit(raw_origin)
+	if parsed.scheme not in ("http", "https"):
+		raise ValueError("The origin must start with http:// or https://.")
+	if not parsed.netloc:
+		raise ValueError("The origin must include a host, e.g. https://your-bullwheel-host.")
+	return f"{parsed.scheme}://{parsed.netloc}"
+
+
 # ─── Printers ─────────────────────────────────────────────────────
 
 
@@ -264,15 +298,24 @@ def receive_job(connection: socket.socket) -> bytes:
 
 
 class USBPrintService:
-	"""Owns the TCP listener and the mutable printer target. The tray menu changes the
-	target through set_printer_name while the server thread resolves it per job, so a
-	new selection applies to the very next job without restarting the service."""
+	"""Owns the TCP listener and the mutable printer target and browser allow-list. The
+	tray menu changes these through set_printer_name / add_allowed_origin /
+	remove_allowed_origin while the server threads read them per job, so a change
+	applies to the very next job without restarting the service."""
 
-	def __init__(self, host: str, port: int, printer_name: str | None, printer_mapping: dict[str, str] | None = None):
+	def __init__(
+		self,
+		host: str,
+		port: int,
+		printer_name: str | None,
+		printer_mapping: dict[str, str] | None = None,
+		allowed_origins: list[str] | None = None,
+	):
 		self.host = host
 		self.port = port
 		self.printer_name = printer_name  # None → follow the Windows default printer
 		self.printer_mapping = printer_mapping or {}  # Browser printer_name → Windows printer
+		self.allowed_origins = list(allowed_origins) if allowed_origins else []  # Browser method's CORS allow-list
 		self.listener = None
 		self.tray_icon = None  # set by run_tray_icon; used for failure notifications
 
@@ -301,6 +344,26 @@ class USBPrintService:
 		self.printer_name = printer_name
 		save_printer_name(printer_name)
 		logger.info(f"Target printer changed to '{printer_name or 'system default'}'.")
+
+	def add_allowed_origin(self, origin: str) -> bool:
+		"""Add a browser origin to the Browser method's CORS allow-list and persist it,
+		taking effect on the very next request. Returns False without changing anything
+		if the origin is already allowed."""
+		if origin in self.allowed_origins:
+			return False
+		self.allowed_origins.append(origin)
+		save_allowed_origins(self.allowed_origins)
+		logger.info(f"Allowed origin added: '{origin}'.")
+		return True
+
+	def remove_allowed_origin(self, origin: str) -> None:
+		"""Remove a browser origin from the allow-list and persist it, taking effect on
+		the very next request."""
+		if origin not in self.allowed_origins:
+			return
+		self.allowed_origins.remove(origin)
+		save_allowed_origins(self.allowed_origins)
+		logger.info(f"Allowed origin removed: '{origin}'.")
 
 	def start_listening(self) -> None:
 		"""Bind and listen on the configured host and port, raising OSError on failure —
@@ -375,11 +438,13 @@ class PrintRequestError(Exception):
 		self.message = message
 
 
-def make_browser_print_handler(service: "USBPrintService", allowed_origins: list[str]):
+def make_browser_print_handler(service: "USBPrintService"):
 	"""Build the BaseHTTPRequestHandler subclass used by the Browser method's HTTP
-	server, bound to this service instance and the configured origin allow-list. A
-	factory is used because http.server instantiates a fresh handler per request and
-	only takes a class, not an already-constructed object."""
+	server, bound to this service instance. Reads service.allowed_origins fresh on
+	every request (rather than capturing a snapshot) so the tray's Allowed Origins menu
+	takes effect on the very next request, with no restart. A factory is used because
+	http.server instantiates a fresh handler per request and only takes a class, not an
+	already-constructed object."""
 
 	class BrowserPrintRequestHandler(BaseHTTPRequestHandler):
 		server_version = "BullwheelUSBPrintService/1.0"
@@ -390,7 +455,7 @@ def make_browser_print_handler(service: "USBPrintService", allowed_origins: list
 			pass
 
 		def _send_cors_headers(self, origin: str | None) -> None:
-			if is_origin_allowed(origin, allowed_origins):
+			if is_origin_allowed(origin, service.allowed_origins):
 				self.send_header("Access-Control-Allow-Origin", origin)
 			self.send_header("Vary", "Origin")
 
@@ -435,7 +500,7 @@ def make_browser_print_handler(service: "USBPrintService", allowed_origins: list
 				self._send_text_response(500, "Unexpected error handling the print job.", origin)
 
 		def _handle_print(self, origin: str | None) -> None:
-			if origin is not None and not is_origin_allowed(origin, allowed_origins):
+			if origin is not None and not is_origin_allowed(origin, service.allowed_origins):
 				raise PrintRequestError(403, "This origin is not allowed to print.")
 
 			content_type = self.headers.get("Content-Type", "")
@@ -493,18 +558,17 @@ def make_browser_print_handler(service: "USBPrintService", allowed_origins: list
 	return BrowserPrintRequestHandler
 
 
-def start_browser_print_server(
-	service: "USBPrintService", http_port: int, allowed_origins: list[str]
-) -> ThreadingHTTPServer:
+def start_browser_print_server(service: "USBPrintService", http_port: int) -> ThreadingHTTPServer:
 	"""Start the Browser method's HTTP listener on 127.0.0.1, bound to loopback only —
 	this endpoint is for browsers on this computer, never reachable from the network.
 	Raises OSError if the port is already taken."""
-	if not allowed_origins:
+	if not service.allowed_origins:
 		logger.warning(
-			"No allowed_origins are configured in settings.json — every Browser-method "
-			"request will be rejected with 403 until at least one origin is added."
+			"No allowed_origins are configured — every Browser-method request will be "
+			"rejected with 403 until at least one origin is added (tray menu: Allowed "
+			"Origins ▸ Add Origin…, or edit settings.json directly)."
 		)
-	handler_class = make_browser_print_handler(service, allowed_origins)
+	handler_class = make_browser_print_handler(service)
 	http_server = ThreadingHTTPServer((HTTP_HOST, http_port), handler_class)
 	logger.info(f"{APPLICATION_NAME} listening for Browser print jobs on http://{HTTP_HOST}:{http_port}/print.")
 	return http_server
@@ -636,6 +700,70 @@ def build_printer_menu_items(service: USBPrintService):
 		yield make_printer_menu_item(service, printer_name)
 
 
+def prompt_for_origin() -> str | None:
+	"""Show a small text-entry dialog asking for a browser origin to allow, returning
+	the raw text entered or None if the dialog was cancelled. Requires tkinter, which
+	ships with a standard Python install; callers should check TKINTER_SUPPORT_AVAILABLE
+	first."""
+	root = tk.Tk()
+	root.withdraw()
+	root.attributes("-topmost", True)
+	try:
+		return simpledialog.askstring(
+			APPLICATION_NAME,
+			"Browser origin to allow (scheme + host, e.g. https://your-bullwheel-host):",
+			parent=root,
+		)
+	finally:
+		root.destroy()
+
+
+def add_allowed_origin_interactively(service: USBPrintService) -> None:
+	"""Handle the tray's Add Origin… command: prompt for text, validate it as an
+	origin, and add it to the service's allow-list, notifying on any problem."""
+	if not TKINTER_SUPPORT_AVAILABLE:
+		show_error_message_box(
+			"Adding an origin from the tray needs tkinter, which is missing from this "
+			"build. Add it to allowed_origins in settings.json instead, then restart."
+		)
+		return
+	raw_origin = prompt_for_origin()
+	if raw_origin is None:  # dialog cancelled
+		return
+	try:
+		origin = normalize_origin(raw_origin)
+	except ValueError as error:
+		show_error_message_box(str(error))
+		return
+	if not service.add_allowed_origin(origin):
+		show_error_message_box(f'"{origin}" is already on the allowed list.')
+
+
+def make_allowed_origin_menu_item(service: USBPrintService, origin: str):
+	"""Build one menu item that removes the given origin when clicked, after
+	confirming — removing one breaks Browser printing for anyone using it, so it isn't
+	a single accidental click away."""
+
+	def remove_origin(icon, item):
+		if confirm_message_box(f"Stop allowing this origin to print?\n\n{origin}"):
+			service.remove_allowed_origin(origin)
+
+	return pystray.MenuItem(f"Remove: {origin}", remove_origin)
+
+
+def build_allowed_origins_menu_items(service: USBPrintService):
+	"""Yield Add Origin… plus one removable item per currently allowed origin, or a
+	disabled placeholder when none are configured. The tray menu calls this every time
+	it opens, so additions and removals are reflected immediately."""
+	yield pystray.MenuItem("Add Origin…", lambda icon, item: add_allowed_origin_interactively(service))
+	yield pystray.Menu.SEPARATOR
+	if service.allowed_origins:
+		for origin in service.allowed_origins:
+			yield make_allowed_origin_menu_item(service, origin)
+	else:
+		yield pystray.MenuItem("(none allowed — Browser printing is disabled)", None, enabled=False)
+
+
 def run_tray_icon(service: USBPrintService, http_port: int) -> None:
 	"""Create the task-tray icon and block on its event loop until Exit is chosen.
 	The header row shows the live target, Target Printer switches it, Start with
@@ -661,6 +789,7 @@ def run_tray_icon(service: USBPrintService, http_port: int) -> None:
 		pystray.MenuItem(describe_target, None, enabled=False),
 		pystray.Menu.SEPARATOR,
 		pystray.MenuItem("Target Printer", pystray.Menu(lambda: build_printer_menu_items(service))),
+		pystray.MenuItem("Allowed Origins", pystray.Menu(lambda: build_allowed_origins_menu_items(service))),
 		pystray.Menu.SEPARATOR,
 		pystray.MenuItem("Start with Windows", toggle_startup, checked=lambda item: is_startup_enabled()),
 		pystray.MenuItem("Open Log File", open_log_file),
@@ -684,6 +813,18 @@ def show_error_message_box(message: str) -> None:
 
 	MB_ICONERROR = 0x00000010
 	ctypes.windll.user32.MessageBoxW(None, message, APPLICATION_NAME, MB_ICONERROR)
+
+
+def confirm_message_box(message: str) -> bool:
+	"""Show a blocking Yes/No Windows dialog, used to confirm a change made from the
+	tray before it takes effect — e.g. removing an allowed origin."""
+	import ctypes
+
+	MB_YESNO = 0x00000004
+	MB_ICONQUESTION = 0x00000020
+	IDYES = 6
+	result = ctypes.windll.user32.MessageBoxW(None, message, APPLICATION_NAME, MB_YESNO | MB_ICONQUESTION)
+	return result == IDYES
 
 
 # ─── Entry Point ──────────────────────────────────────────────────
@@ -759,7 +900,7 @@ def main() -> None:
 	printer_mapping = load_printer_mapping()
 	allowed_origins = load_allowed_origins()
 
-	service = USBPrintService(arguments.host, arguments.port, printer_name, printer_mapping)
+	service = USBPrintService(arguments.host, arguments.port, printer_name, printer_mapping, allowed_origins)
 	try:
 		service.start_listening()
 	except OSError as error:
@@ -773,7 +914,7 @@ def main() -> None:
 		sys.exit(1)
 
 	try:
-		http_server = start_browser_print_server(service, arguments.http_port, allowed_origins)
+		http_server = start_browser_print_server(service, arguments.http_port)
 	except OSError as error:
 		message = (
 			f"Could not listen on {HTTP_HOST}:{arguments.http_port}: {error}\n"
